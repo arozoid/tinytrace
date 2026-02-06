@@ -159,6 +159,7 @@ fn path_arg_index(sysno: u32) -> Option<usize> {
         }
         _ => None,
     }
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
