@@ -13,7 +13,7 @@ struct Args {
     program: String,
 
     /// Arguments for the program
-    #[arg(last = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 
     /// Optional rootdir for rootless overlay

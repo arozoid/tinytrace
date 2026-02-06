@@ -3,7 +3,6 @@ use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
-use std::collections::VecDeque;
 use syscalls::Sysno;
 
 #[derive(Debug, Clone)]
@@ -26,11 +25,9 @@ pub fn child_setup() {
 
 pub fn trace_loop(child: Pid, config: TraceConfig) {
     let _ = waitpid(child, None);
-
     ptrace::setoptions(child, ptrace::Options::PTRACE_O_TRACESYSGOOD).expect("setoptions failed");
 
     let mut in_syscall = false;
-    let mut injected: VecDeque<(u64, usize)> = VecDeque::new();
 
     loop {
         if ptrace::syscall(child, None).is_err() {
@@ -39,23 +36,19 @@ pub fn trace_loop(child: Pid, config: TraceConfig) {
 
         match waitpid(child, None) {
             Ok(WaitStatus::PtraceSyscall(_)) => {
-                let mut regs = unsafe { get_regs(child.as_raw()) };
-                let nr = syscall_number(&regs) as u32;
-
                 if !in_syscall {
-                    if let Some(action) = maybe_rewrite_path(child, &mut regs, nr, &config) {
-                        match inject_rewritten_path(child, &mut regs, nr, &action, &config) {
-                            Ok(allocs) => injected.extend(allocs),
-                            Err(e) => eprintln!("[tinytrace] rewrite error: {e}"),
+                    let mut regs = unsafe { get_regs(child.as_raw()) };
+                    let nr = syscall_number(&regs) as u32;
+
+                    if let Some(action) = maybe_rewrite_path(child, &regs, nr, &config) {
+                        if let Err(e) =
+                            inject_rewritten_path(child, &mut regs, nr, &action, &config)
+                        {
+                            eprintln!("[tinytrace] rewrite error: {e}");
                         }
                     }
-                    in_syscall = true;
-                } else {
-                    while let Some((addr, len)) = injected.pop_front() {
-                        let _ = remote_munmap(child, addr, len);
-                    }
-                    in_syscall = false;
                 }
+                in_syscall = !in_syscall;
             }
             Ok(WaitStatus::Exited(_, code)) => {
                 eprintln!("[tinytrace] child exited ({code})");
@@ -73,7 +66,7 @@ pub fn trace_loop(child: Pid, config: TraceConfig) {
 
 fn maybe_rewrite_path(
     child: Pid,
-    regs: &mut Regs,
+    regs: &Regs,
     sysno: u32,
     config: &TraceConfig,
 ) -> Option<RewriteAction> {
@@ -120,37 +113,30 @@ fn inject_rewritten_path(
     sysno: u32,
     action: &RewriteAction,
     config: &TraceConfig,
-) -> Result<Vec<(u64, usize)>, Errno> {
-    let mut allocs = Vec::new();
-    let remote = remote_mmap(child, action.new_value.len() + 1)?;
-    write_cstr_to_child(child.as_raw(), remote, &action.new_value)?;
-    set_arg(regs, action.arg_index, remote);
-    allocs.push((remote, action.new_value.len() + 1));
+) -> Result<(), Errno> {
+    let mut cursor = stack_pointer(regs).saturating_sub(0x4000);
+
+    let rewritten_remote = write_cstr_on_stack(child.as_raw(), &mut cursor, &action.new_value)?;
+    set_arg(regs, action.arg_index, rewritten_remote);
 
     if config.loader_shim && sysno == Sysno::execve as u32 {
         if let Some((loader, target)) = loader_paths(config, &action.new_value) {
-            let loader_remote = remote_mmap(child, loader.len() + 1)?;
-            write_cstr_to_child(child.as_raw(), loader_remote, &loader)?;
-            allocs.push((loader_remote, loader.len() + 1));
-
-            let target_remote = remote_mmap(child, target.len() + 1)?;
-            write_cstr_to_child(child.as_raw(), target_remote, &target)?;
-            allocs.push((target_remote, target.len() + 1));
+            let loader_remote = write_cstr_on_stack(child.as_raw(), &mut cursor, &loader)?;
+            let target_remote = write_cstr_on_stack(child.as_raw(), &mut cursor, &target)?;
 
             let argv_addr = get_arg(regs, 1);
             let original_argv = read_ptr_array(child.as_raw(), argv_addr, 256)?;
-            let mut new_argv = vec![loader_remote, target_remote];
+            let mut new_argv = vec![target_remote];
             new_argv.extend(original_argv.into_iter().skip(1));
-            let argv_remote = write_ptr_array(child.as_raw(), child, &new_argv)?;
-            allocs.push((argv_remote.0, argv_remote.1));
+            let argv_remote = write_ptr_array_on_stack(child.as_raw(), &mut cursor, &new_argv)?;
 
             set_arg(regs, 0, loader_remote);
-            set_arg(regs, 1, argv_remote.0);
+            set_arg(regs, 1, argv_remote);
         }
     }
 
     unsafe { set_regs(child.as_raw(), regs) };
-    Ok(allocs)
+    Ok(())
 }
 
 fn loader_paths(config: &TraceConfig, rewritten_exec: &str) -> Option<(String, String)> {
@@ -173,6 +159,7 @@ fn path_arg_index(sysno: u32) -> Option<usize> {
         }
         _ => None,
     }
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -190,6 +177,8 @@ const NT_PRSTATUS: libc::c_ulong = 1;
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn get_regs(pid: pid_t) -> Regs {
+    use libc::{PTRACE_GETREGSET, iovec};
+
     let mut regs: Regs = std::mem::zeroed();
     let mut io = iovec {
         iov_base: &mut regs as *mut _ as *mut c_void,
@@ -215,35 +204,37 @@ unsafe fn set_regs(pid: pid_t, regs: &Regs) {
 fn syscall_number(regs: &Regs) -> u64 {
     regs.regs[8]
 }
-
 #[cfg(target_arch = "aarch64")]
 fn get_arg(regs: &Regs, idx: usize) -> u64 {
     regs.regs[idx]
 }
-
 #[cfg(target_arch = "aarch64")]
 fn set_arg(regs: &mut Regs, idx: usize, value: u64) {
     regs.regs[idx] = value;
 }
+#[cfg(target_arch = "aarch64")]
+fn stack_pointer(regs: &Regs) -> u64 {
+    regs.sp
+}
 
 #[cfg(target_arch = "x86_64")]
 type Regs = libc::user_regs_struct;
-
 #[cfg(target_arch = "x86_64")]
 unsafe fn get_regs(pid: pid_t) -> Regs {
     ptrace::getregs(Pid::from_raw(pid)).expect("PTRACE_GETREGS failed")
 }
-
 #[cfg(target_arch = "x86_64")]
 unsafe fn set_regs(pid: pid_t, regs: &Regs) {
     ptrace::setregs(Pid::from_raw(pid), *regs).expect("PTRACE_SETREGS failed")
 }
-
 #[cfg(target_arch = "x86_64")]
 fn syscall_number(regs: &Regs) -> u64 {
     regs.orig_rax
 }
-
+#[cfg(target_arch = "x86_64")]
+fn stack_pointer(regs: &Regs) -> u64 {
+    regs.rsp
+}
 #[cfg(target_arch = "x86_64")]
 fn get_arg(regs: &Regs, idx: usize) -> u64 {
     match idx {
@@ -256,7 +247,6 @@ fn get_arg(regs: &Regs, idx: usize) -> u64 {
         _ => 0,
     }
 }
-
 #[cfg(target_arch = "x86_64")]
 fn set_arg(regs: &mut Regs, idx: usize, value: u64) {
     match idx {
@@ -268,66 +258,6 @@ fn set_arg(regs: &mut Regs, idx: usize, value: u64) {
         5 => regs.r9 = value,
         _ => {}
     }
-}
-
-fn remote_mmap(child: Pid, size: usize) -> Result<u64, Errno> {
-    let mut regs = unsafe { get_regs(child.as_raw()) };
-    let saved = regs;
-
-    set_arg(&mut regs, 0, 0);
-    set_arg(&mut regs, 1, size as u64);
-    set_arg(&mut regs, 2, (libc::PROT_READ | libc::PROT_WRITE) as u64);
-    set_arg(
-        &mut regs,
-        3,
-        (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
-    );
-    set_arg(&mut regs, 4, !0u64);
-    set_arg(&mut regs, 5, 0);
-    set_syscall_number(&mut regs, Sysno::mmap as u64);
-
-    unsafe { set_regs(child.as_raw(), &regs) };
-    ptrace::syscall(child, None).ok();
-    let _ = waitpid(child, None);
-
-    let regs = unsafe { get_regs(child.as_raw()) };
-    let addr = syscall_retval(&regs);
-
-    unsafe { set_regs(child.as_raw(), &saved) };
-    Ok(addr)
-}
-
-fn remote_munmap(child: Pid, addr: u64, size: usize) -> Result<(), Errno> {
-    let mut regs = unsafe { get_regs(child.as_raw()) };
-    let saved = regs;
-
-    set_arg(&mut regs, 0, addr);
-    set_arg(&mut regs, 1, size as u64);
-    set_syscall_number(&mut regs, Sysno::munmap as u64);
-
-    unsafe { set_regs(child.as_raw(), &regs) };
-    ptrace::syscall(child, None).ok();
-    let _ = waitpid(child, None);
-    unsafe { set_regs(child.as_raw(), &saved) };
-    Ok(())
-}
-
-#[cfg(target_arch = "aarch64")]
-fn syscall_retval(regs: &Regs) -> u64 {
-    regs.regs[0]
-}
-#[cfg(target_arch = "x86_64")]
-fn syscall_retval(regs: &Regs) -> u64 {
-    regs.rax
-}
-
-#[cfg(target_arch = "aarch64")]
-fn set_syscall_number(regs: &mut Regs, nr: u64) {
-    regs.regs[8] = nr;
-}
-#[cfg(target_arch = "x86_64")]
-fn set_syscall_number(regs: &mut Regs, nr: u64) {
-    regs.orig_rax = nr;
 }
 
 fn read_ptr_array(pid: pid_t, addr: u64, max: usize) -> Result<Vec<u64>, Errno> {
@@ -343,20 +273,30 @@ fn read_ptr_array(pid: pid_t, addr: u64, max: usize) -> Result<Vec<u64>, Errno> 
     Ok(out)
 }
 
-fn write_ptr_array(pid: pid_t, child: Pid, values: &[u64]) -> Result<(u64, usize), Errno> {
-    let size = (values.len() + 1) * std::mem::size_of::<u64>();
-    let remote = remote_mmap(child, size)?;
+fn write_cstr_on_stack(pid: pid_t, cursor: &mut u64, s: &str) -> Result<u64, Errno> {
+    let start = align_up(*cursor, 8);
+    write_cstr_to_child(pid, start, s)?;
+    *cursor = start + (s.len() as u64) + 1;
+    Ok(start)
+}
+
+fn write_ptr_array_on_stack(pid: pid_t, cursor: &mut u64, values: &[u64]) -> Result<u64, Errno> {
+    let start = align_up(*cursor, 8);
     for (i, val) in values.iter().enumerate() {
-        write_word(pid, remote + (i * 8) as u64, *val)?;
+        write_word(pid, start + (i * 8) as u64, *val)?;
     }
-    write_word(pid, remote + (values.len() * 8) as u64, 0)?;
-    Ok((remote, size))
+    write_word(pid, start + (values.len() * 8) as u64, 0)?;
+    *cursor = start + ((values.len() + 1) * 8) as u64;
+    Ok(start)
+}
+
+fn align_up(v: u64, a: u64) -> u64 {
+    (v + (a - 1)) & !(a - 1)
 }
 
 fn read_cstr_from_child(pid: pid_t, addr: u64, max_len: usize) -> Result<String, Errno> {
     let mut out = Vec::new();
     let mut off = 0usize;
-
     while out.len() < max_len {
         let word = unsafe {
             libc::ptrace(
@@ -366,14 +306,12 @@ fn read_cstr_from_child(pid: pid_t, addr: u64, max_len: usize) -> Result<String,
                 std::ptr::null_mut::<c_void>(),
             )
         };
-
         if word == -1 {
             let e = Errno::last();
             if e != Errno::UnknownErrno {
                 return Err(e);
             }
         }
-
         for b in (word as u64).to_le_bytes() {
             if b == 0 {
                 return Ok(String::from_utf8_lossy(&out).into_owned());
@@ -385,7 +323,6 @@ fn read_cstr_from_child(pid: pid_t, addr: u64, max_len: usize) -> Result<String,
         }
         off += 8;
     }
-
     Err(Errno::ENAMETOOLONG)
 }
 
@@ -393,7 +330,6 @@ fn write_cstr_to_child(pid: pid_t, addr: u64, s: &str) -> Result<(), Errno> {
     let bytes = s.as_bytes();
     let total = bytes.len() + 1;
     let mut offset = 0usize;
-
     while offset < total {
         let mut word = read_word(pid, addr + offset as u64)?;
         for i in 0..8 {
