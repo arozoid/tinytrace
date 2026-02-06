@@ -1,5 +1,4 @@
 use nix::unistd::{fork, ForkResult, execvp};
-use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus};
 use std::ffi::CString;
 use clap::Parser;
@@ -26,17 +25,17 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    match unsafe { fork() }.unwrap() {
+    match unsafe { fork() }.expect("fork failed") {
         ForkResult::Child => {
             // setup ptrace in child
             syscall::child_setup();
 
             // prepare exec arguments
-            let prog_c = CString::new(args.program).unwrap();
+            let prog_c = CString::new(args.program.clone()).unwrap();
             let mut cargs: Vec<CString> = Vec::with_capacity(args.args.len() + 1);
             cargs.push(prog_c.clone());
             for a in &args.args {
-                cargs.push(CString::new(a.clone()).unwrap());
+                cargs.push(CString::new(a.as_str()).unwrap());
             }
 
             execvp(&prog_c, &cargs).expect("exec failed");
